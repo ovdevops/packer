@@ -17,6 +17,9 @@ This builder clones VMs from existing templates.
 
 - VMware Player is not required.
 - It uses the official vCenter API, and does not require ESXi host [modification](https://www.packer.io/docs/builders/vmware-iso.html#building-on-a-remote-vsphere-hypervisor)
+- This builder is supported for vSphere version 6.5 and greater. Builds on lower
+versions may work, but some configuration options may throw errors because they
+do not exist in the older versions of the vSphere API.
 
 ## Examples
 
@@ -167,6 +170,35 @@ can be done via environment variable:
 #### Output Configuration:
 
 @include 'builder/vsphere/common/OutputConfig-not-required.mdx'
+
+### Content Library Import Configuration
+
+@include 'builder/vsphere/common/ContentLibraryDestinationConfig.mdx'
+
+@include 'builder/vsphere/common/ContentLibraryDestinationConfig-not-required.mdx'
+
+Minimal example of usage:
+
+<Tabs>
+<Tab heading="JSON">
+
+```json
+	"content_library_destination" : {
+	    "library": "Packer Library Test"
+	}
+```
+
+</Tab>
+<Tab heading="HCL2">
+
+```hcl
+	content_library_destination {
+			library = "Packer Library Test"
+	}
+```
+
+</Tab>
+</Tabs>
 
 ## Working with Clusters
 

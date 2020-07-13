@@ -11,12 +11,12 @@ import (
 	"time"
 
 	"github.com/hashicorp/packer/packer"
-
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/nfc"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/ovf"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/vapi/vcenter"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
@@ -53,6 +53,7 @@ type HardwareConfig struct {
 	VideoRAM            int64
 	VGPUProfile         string
 	Firmware            string
+	ForceBIOSSetup      bool
 }
 
 type NIC struct {
@@ -63,7 +64,7 @@ type NIC struct {
 }
 
 type CreateConfig struct {
-	DiskControllerType string // example: "scsi", "pvscsi"
+	DiskControllerType []string // example: "scsi", "pvscsi", "lsilogic"
 
 	Annotation    string
 	Name          string
@@ -75,8 +76,7 @@ type CreateConfig struct {
 	GuestOS       string // example: otherGuest
 	NICs          []NIC
 	USBController bool
-	Version       uint   // example: 10
-	Firmware      string // efi-secure, efi or bios
+	Version       uint // example: 10
 	Storage       []Disk
 }
 
@@ -84,6 +84,7 @@ type Disk struct {
 	DiskSize            int64
 	DiskEagerlyScrub    bool
 	DiskThinProvisioned bool
+	ControllerIndex     int
 }
 
 func (d *Driver) NewVM(ref *types.ManagedObjectReference) *VirtualMachine {
@@ -137,14 +138,6 @@ func (d *Driver) CreateVM(config *CreateConfig) (*VirtualMachine, error) {
 	}
 	if config.Version != 0 {
 		createSpec.Version = fmt.Sprintf("%s%d", "vmx-", config.Version)
-	}
-	if config.Firmware == "efi-secure" {
-		createSpec.Firmware = "efi"
-		createSpec.BootOptions = &types.VirtualMachineBootOptions{
-			EfiSecureBootEnabled: types.NewBool(true),
-		}
-	} else if config.Firmware != "" {
-		createSpec.Firmware = config.Firmware
 	}
 
 	folder, err := d.FindFolder(config.Folder)
@@ -498,13 +491,18 @@ func (vm *VirtualMachine) Configure(config *HardwareConfig) error {
 		confSpec.DeviceChange = append(confSpec.DeviceChange, spec)
 	}
 
-	if config.Firmware == "efi-secure" || config.Firmware == "efi" {
-		confSpec.Firmware = "efi"
-		confSpec.BootOptions = &types.VirtualMachineBootOptions{
-			EfiSecureBootEnabled: types.NewBool(config.Firmware == "efi-secure"),
-		}
-	} else if config.Firmware != "" {
-		confSpec.Firmware = config.Firmware
+	efiSecureBootEnabled := false
+	firmware := config.Firmware
+
+	if firmware == "efi-secure" {
+		firmware = "efi"
+		efiSecureBootEnabled = true
+	}
+
+	confSpec.Firmware = firmware
+	confSpec.BootOptions = &types.VirtualMachineBootOptions{
+		EnterBIOSSetup:       types.NewBool(config.ForceBIOSSetup),
+		EfiSecureBootEnabled: types.NewBool(efiSecureBootEnabled),
 	}
 
 	task, err := vm.vm.Reconfigure(vm.driver.ctx, confSpec)
@@ -667,6 +665,60 @@ func (vm *VirtualMachine) ConvertToTemplate() error {
 	return vm.vm.MarkAsTemplate(vm.driver.ctx)
 }
 
+func (vm *VirtualMachine) ImportToContentLibrary(template vcenter.Template) error {
+	template.SourceVM = vm.vm.Reference().Value
+
+	l, err := vm.driver.FindContentLibrary(template.Library)
+	if err != nil {
+		return err
+	}
+	if l.library.Type != "LOCAL" {
+		return fmt.Errorf("can not deploy a VM to the content library %s of type %s; the content library must be of type LOCAL", template.Library, l.library.Type)
+	}
+	template.Library = l.library.ID
+
+	if template.Placement.Cluster != "" {
+		c, err := vm.driver.FindCluster(template.Placement.Cluster)
+		if err != nil {
+			return err
+		}
+		template.Placement.Cluster = c.cluster.Reference().Value
+	}
+	if template.Placement.Folder != "" {
+		f, err := vm.driver.FindFolder(template.Placement.Folder)
+		if err != nil {
+			return err
+		}
+		template.Placement.Folder = f.folder.Reference().Value
+	}
+	if template.Placement.Host != "" {
+		h, err := vm.driver.FindHost(template.Placement.Host)
+		if err != nil {
+			return err
+		}
+		template.Placement.Host = h.host.Reference().Value
+	}
+	if template.Placement.ResourcePool != "" {
+		rp, err := vm.driver.FindResourcePool(template.Placement.Cluster, template.Placement.Host, template.Placement.ResourcePool)
+		if err != nil {
+			return err
+		}
+		template.Placement.ResourcePool = rp.pool.Reference().Value
+	}
+
+	if template.VMHomeStorage != nil {
+		d, err := vm.driver.FindDatastore(template.VMHomeStorage.Datastore, template.Placement.Host)
+		if err != nil {
+			return err
+		}
+		template.VMHomeStorage.Datastore = d.ds.Reference().Value
+	}
+
+	vcm := vcenter.NewManager(vm.driver.restClient)
+	_, err = vcm.CreateTemplate(vm.driver.ctx, template)
+	return err
+}
+
 func (vm *VirtualMachine) GetDir() (string, error) {
 	vmInfo, err := vm.Info("name", "layoutEx.file")
 	if err != nil {
@@ -687,14 +739,22 @@ func addDisk(_ *Driver, devices object.VirtualDeviceList, config *CreateConfig) 
 		return nil, errors.New("no storage devices have been defined")
 	}
 
-	device, err := devices.CreateSCSIController(config.DiskControllerType)
-	if err != nil {
-		return nil, err
+	if len(config.DiskControllerType) == 0 {
+		return nil, errors.New("no controllers have been defined")
 	}
-	devices = append(devices, device)
-	controller, err := devices.FindDiskController(devices.Name(device))
-	if err != nil {
-		return nil, err
+
+	var controllers []types.BaseVirtualController
+	for _, controllerType := range config.DiskControllerType {
+		device, err := devices.CreateSCSIController(controllerType)
+		if err != nil {
+			return nil, err
+		}
+		devices = append(devices, device)
+		controller, err := devices.FindDiskController(devices.Name(device))
+		if err != nil {
+			return nil, err
+		}
+		controllers = append(controllers, controller)
 	}
 
 	for _, dc := range config.Storage {
@@ -710,7 +770,7 @@ func addDisk(_ *Driver, devices object.VirtualDeviceList, config *CreateConfig) 
 			CapacityInKB: dc.DiskSize * 1024,
 		}
 
-		devices.AssignController(disk, controller)
+		devices.AssignController(disk, controllers[dc.ControllerIndex])
 		devices = append(devices, disk)
 	}
 
@@ -753,11 +813,35 @@ func addNetwork(d *Driver, devices object.VirtualDeviceList, config *CreateConfi
 func findNetwork(network string, host string, d *Driver) (object.NetworkReference, error) {
 	if network != "" {
 		var err error
-		network, err := d.finder.Network(d.ctx, network)
+		networks, err := d.FindNetworks(network)
 		if err != nil {
 			return nil, err
 		}
-		return network, nil
+		if len(networks) == 1 {
+			return networks[0].network, nil
+		}
+
+		// If there are multiple networks then try to match the host
+		if host != "" {
+			h, err := d.FindHost(host)
+			if err != nil {
+				return nil, &MultipleNetworkFoundError{network, fmt.Sprintf("unable to match a network to the host %s: %s", host, err.Error())}
+			}
+			for _, n := range networks {
+				info, err := n.Info("host")
+				if err != nil {
+					continue
+				}
+				for _, host := range info.Host {
+					if h.host.Reference().Value == host.Reference().Value {
+						return n.network, nil
+					}
+				}
+			}
+			return nil, &MultipleNetworkFoundError{network, fmt.Sprintf("unable to match a network to the host %s", host)}
+		}
+
+		return nil, &MultipleNetworkFoundError{network, "please provide a host to match or the network full path"}
 	}
 
 	if host != "" {
